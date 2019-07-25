@@ -19,3 +19,7 @@ go.sum
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+
+# Release
+*.zip
+release.txt
