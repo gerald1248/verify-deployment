@@ -1,3 +1,5 @@
+// TODO: flag first restart as failure
+
 package main
 
 import (
@@ -5,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 	"strings"
 	"time"
@@ -61,37 +64,55 @@ func (c *Controller) syncToStdout(key string) error {
 		return nil
 	}
 
-	// skip events created prior to the controller starting
-	creationTimestamp := obj.(*v1.Event).ObjectMeta.CreationTimestamp
-	if creationTimestamp.Unix() < c.state.time {
+	// exit condition 2: no conditions recorded
+	conditions := obj.(*v1.Pod).Status.Conditions
+	if len(conditions) == 0 {
 		return nil
 	}
 
-	kind := obj.(*v1.Event).InvolvedObject.Kind
-	name := obj.(*v1.Event).InvolvedObject.Name
+	// exit condition 3: last transition time predates verifier
+	lastTransitionTime := conditions[len(conditions)-1].LastTransitionTime
+	if lastTransitionTime.Unix() < c.state.time {
+		return nil
+	}
+
+	name := obj.(*v1.Pod).ObjectMeta.Name
 
 	// pods managed by deployments carry hashed information after trailing dash
-	if (kind != "Pod" || !strings.HasPrefix(name, c.state.name)) {
+	if (!strings.HasPrefix(name, c.state.name)) {
 		return nil
 	}
 
-	reason := obj.(*v1.Event).Reason
-	message := obj.(*v1.Event).Message
-	eventType := obj.(*v1.Event).Type
+	phase := obj.(*v1.Pod).Status.Phase
+	readyCount := 0
+	containerCount := 0
+	for _, containerStatus := range obj.(*v1.Pod).Status.ContainerStatuses {
+		containerCount++
+		if containerStatus.Ready == true {
+			readyCount++
+		}
+	}
 
-	if eventType == "Normal" {
-		log.Println(fmt.Sprintf("%s: %s", au.Bold(au.Cyan("INFO")), message))
-		if reason == "Started" {
-			c.mutex.Lock()
-			c.state.running += 1
-			c.mutex.Unlock()
+	switch phase {
+	case "Pending":
+		log.Println(fmt.Sprintf("%s: pod %s %s (%d/%d)", au.Bold(au.Cyan("INFO")), name, au.Bold(phase), readyCount, containerCount))
+		return nil
+	case "Running":
+		log.Println(fmt.Sprintf("%s: pod %s %s (%d/%d)", au.Bold(au.Cyan("INFO")), name, au.Bold(phase), readyCount, containerCount))
+		if readyCount < containerCount {
+			return nil
 		}
-	} else {
-		log.Println(fmt.Sprintf("%s: %s", au.Bold(au.Magenta("WARN")), message))
-		if strings.HasPrefix(reason, "Failed") || strings.HasPrefix(reason, "Evicted") {
-			log.Println(fmt.Sprintf("%s: deployment %s failed", au.Bold(au.Red("ERROR")), name))
-			os.Exit(1)
-		}
+		c.mutex.Lock()
+		c.state.running += 1
+		c.mutex.Unlock()
+	case "Succeeded":
+		log.Println(fmt.Sprintf("%s: pod %s %s", au.Bold(au.Cyan("INFO")), name, au.Bold(phase)))
+		c.mutex.Lock()
+		c.state.running += 1
+		c.mutex.Unlock()
+	case "Failed":
+		log.Println(fmt.Sprintf("%s: pod %s %s", au.Bold(au.Red("ERROR")), name, au.Bold(phase)))
+		os.Exit(1)
 	}
 
 	if c.state.running >= c.state.replicas {
@@ -102,6 +123,7 @@ func (c *Controller) syncToStdout(key string) error {
 	// let historical events drain away first
 	if c.queue.Len() == 0 {
 	}
+
 	return nil
 }
 
@@ -142,7 +164,7 @@ func (c *Controller) Run(threadiness int, stopCh chan struct{}) {
 	}
 
 	<-stopCh
-	log.Println(fmt.Sprintf("%s: stopping verify-deployment", au.Bold(au.Cyan("INFO"))))
+	log.Println(fmt.Sprintf("%s: stopped verifying deployment", au.Bold(au.Cyan("INFO"))))
 }
 
 func (c *Controller) runWorker() {
@@ -151,27 +173,29 @@ func (c *Controller) runWorker() {
 }
 
 func main() {
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s <DEPLOYMENT>\n", filepath.Base(os.Args[0]))
+		flag.PrintDefaults()
+		os.Exit(1)
+	}
 	var kubeconfig string
 	var master string
-	var name string
 	var namespace string
 	var replicas int
-	var debug bool
 	var timeout int
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&master, "master", "", "master url")
-	flag.StringVar(&name, "name", "", "deployment name")
 	flag.StringVar(&namespace, "namespace", "default", "namespace")
 	flag.IntVar(&replicas, "replicas", 1, "replicas")
-	flag.BoolVar(&debug, "debug", false, "debug mode")
 	flag.IntVar(&timeout, "timeout", 300, "timeout (s)")
 	flag.Parse()
 
-	if len(name) == 0 {
+	if len(flag.Args()) == 0 {
 		fmt.Fprintf(os.Stderr, "%s: deployment name required\n", au.Bold(au.Red("ERROR")))
-		os.Exit(1)
+		flag.Usage()
 	}
+	name := flag.Args()[0]
 
 	// support out-of-cluster deployments (param, env var only)
 	if len(kubeconfig) == 0 {
@@ -211,17 +235,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	realMain(clientset, getState(name, namespace, replicas, time.Now().Local().Unix(), debug))
+	realMain(clientset, getState(name, namespace, replicas, time.Now().Local().Unix()))
 }
 
 func realMain(clientset kubernetes.Interface, state State) {
 	var mutex = &sync.Mutex{}
 
-	eventListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "events", state.namespace, fields.Everything())
+	eventListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", state.namespace, fields.Everything())
 
 	queue := workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter())
 
-	indexer, informer := cache.NewIndexerInformer(eventListWatcher, &v1.Event{}, 0, cache.ResourceEventHandlerFuncs{
+	indexer, informer := cache.NewIndexerInformer(eventListWatcher, &v1.Pod{}, 0, cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			key, err := cache.MetaNamespaceKeyFunc(obj)
 			if err == nil {

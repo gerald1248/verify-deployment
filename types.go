@@ -23,5 +23,4 @@ type State struct {
 	replicas int
 	running int
 	time int64
-	debug bool
 }
