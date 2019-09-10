@@ -20,7 +20,7 @@ type Controller struct {
 type State struct {
 	name string
 	namespace string
-	replicas int
-	running int
+	running int32
 	time int64
+	desiredReplicas int32
 }

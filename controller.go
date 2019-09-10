@@ -21,6 +21,7 @@ import (
 	"k8s.io/client-go/util/workqueue"
 
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	rest "k8s.io/client-go/rest"
 
 	au "github.com/logrusorgru/aurora"
@@ -83,45 +84,31 @@ func (c *Controller) syncToStdout(key string) error {
 		return nil
 	}
 
-	phase := obj.(*v1.Pod).Status.Phase
-	readyCount := 0
-	containerCount := 0
-	for _, containerStatus := range obj.(*v1.Pod).Status.ContainerStatuses {
-		containerCount++
-		if containerStatus.Ready == true {
-			readyCount++
-		}
+	// now we know we're dealing with a phase change for our deployment
+	// we'd be done if deployments reported on pods' ready status,
+	// but as they don't we count the running pods
+	runningReplicas, err := getRunningReplicas(c.clientset, c.state)
+	if err != nil {
+		log.Println(fmt.Sprintf("%s: can't determine number of running replicas", au.Bold(au.Red("ERROR"))))
+		return nil
 	}
 
+	phase := obj.(*v1.Pod).Status.Phase
 	switch phase {
 	case "Pending":
-		log.Println(fmt.Sprintf("%s: pod %s %s (%d/%d)", au.Bold(au.Cyan("INFO")), name, au.Bold(phase), readyCount, containerCount))
-		return nil
+		log.Println(fmt.Sprintf("%s: pod %s %s (%d/%d)", au.Bold(au.Cyan("INFO")), name, au.Bold(phase), runningReplicas, c.state.desiredReplicas))
 	case "Running":
-		log.Println(fmt.Sprintf("%s: pod %s %s (%d/%d)", au.Bold(au.Cyan("INFO")), name, au.Bold(phase), readyCount, containerCount))
-		if readyCount < containerCount {
-			return nil
-		}
-		c.mutex.Lock()
-		c.state.running += 1
-		c.mutex.Unlock()
+		log.Println(fmt.Sprintf("%s: pod %s %s (%d/%d)", au.Bold(au.Cyan("INFO")), name, au.Bold(phase), runningReplicas, c.state.desiredReplicas))
 	case "Succeeded":
-		log.Println(fmt.Sprintf("%s: pod %s %s", au.Bold(au.Cyan("INFO")), name, au.Bold(phase)))
-		c.mutex.Lock()
-		c.state.running += 1
-		c.mutex.Unlock()
+		log.Println(fmt.Sprintf("%s: pod %s %s (%d/%d)", au.Bold(au.Cyan("INFO")), name, au.Bold(phase), runningReplicas, c.state.desiredReplicas))
 	case "Failed":
-		log.Println(fmt.Sprintf("%s: pod %s %s", au.Bold(au.Red("ERROR")), name, au.Bold(phase)))
+		log.Println(fmt.Sprintf("%s: pod %s %s (%d/%d)", au.Bold(au.Red("ERROR")), name, au.Bold(phase), runningReplicas, c.state.desiredReplicas))
 		os.Exit(1)
-	}
+        }
 
-	if c.state.running >= c.state.replicas {
-		log.Println(fmt.Sprintf("%s: deployment %s verified", au.Bold(au.Green("OK")), c.state.name))
-		os.Exit(0)
-	}
-
-	// let historical events drain away first
-	if c.queue.Len() == 0 {
+	if runningReplicas == c.state.desiredReplicas {
+                log.Println(fmt.Sprintf("%s: deployment %s verified", au.Bold(au.Green("OK")), c.state.name))
+                os.Exit(0)
 	}
 
 	return nil
@@ -151,6 +138,11 @@ func (c *Controller) Run(threadiness int, stopCh chan struct{}) {
 
 	defer c.queue.ShutDown()
 	log.Println(fmt.Sprintf("%s: verifying deployment %s", au.Bold(au.Cyan("INFO")), c.state.name))
+	plural := ""
+	if c.state.desiredReplicas != 1 {
+		plural = "s"
+	}
+	log.Println(fmt.Sprintf("%s: %d replica%s desired", au.Bold(au.Cyan("INFO")), au.Bold(c.state.desiredReplicas), plural))
 
 	go c.informer.Run(stopCh)
 
@@ -181,13 +173,11 @@ func main() {
 	var kubeconfig string
 	var master string
 	var namespace string
-	var replicas int
 	var timeout int
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&master, "master", "", "master url")
 	flag.StringVar(&namespace, "namespace", "default", "namespace")
-	flag.IntVar(&replicas, "replicas", 1, "replicas")
 	flag.IntVar(&timeout, "timeout", 300, "timeout (s)")
 	flag.Parse()
 
@@ -235,11 +225,64 @@ func main() {
 		os.Exit(1)
 	}
 
-	realMain(clientset, getState(name, namespace, replicas, time.Now().Local().Unix()))
+	realMain(clientset, getState(name, namespace, time.Now().Local().Unix()))
+}
+
+func getDesiredReplicas(clientset kubernetes.Interface, state State) (int32, error) {
+        deployments, err := clientset.AppsV1().Deployments(state.namespace).List(metav1.ListOptions{})
+	if err != nil {
+		return 0, err
+	} else if len(deployments.Items) == 0 {
+		return 0, fmt.Errorf("no deployments in namespace %s", state.namespace)
+	}
+	for _, deployment := range deployments.Items {
+		if deployment.ObjectMeta.Name != state.name {
+			continue
+		}
+		return *deployment.Spec.Replicas, nil
+	}
+	return 0, fmt.Errorf("no deployment %s in namespace %s", state.name, state.namespace)
+}
+
+func getRunningReplicas(clientset kubernetes.Interface, state State) (int32, error) {
+        pods, err := clientset.CoreV1().Pods(state.namespace).List(metav1.ListOptions{})
+
+        if err != nil {
+                return 0, err
+        }
+
+        var ready int32
+	ready = 0
+        for _, pod := range pods.Items {
+                podName := pod.ObjectMeta.Name
+                if strings.HasPrefix(podName, state.name) {
+			var containerReady int
+			var containerNonReady int
+                        for _, containerStatus := range pod.Status.ContainerStatuses {
+				if containerStatus.Ready == true {
+					containerReady++
+				} else {
+					containerNonReady++
+				}
+			}
+			if containerNonReady == 0 && containerReady > 0 {
+				ready++
+			}
+                }
+	}
+
+	return ready, nil
 }
 
 func realMain(clientset kubernetes.Interface, state State) {
 	var mutex = &sync.Mutex{}
+
+	desiredReplicas, err := getDesiredReplicas(clientset, state)
+	if err != nil {
+		log.Println(fmt.Sprintf("%s: %v", au.Bold(au.Red("ERROR")), err))
+		return
+	}
+	state.desiredReplicas = desiredReplicas
 
 	eventListWatcher := cache.NewListWatchFromClient(clientset.CoreV1().RESTClient(), "pods", state.namespace, fields.Everything())
 
