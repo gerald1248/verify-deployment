@@ -18,9 +18,9 @@ type Controller struct {
 }
 
 type State struct {
-	name string
-	namespace string
-	running int32
-	time int64
+	name            string
+	namespace       string
+	running         int32
+	time            int64
 	desiredReplicas int32
 }
