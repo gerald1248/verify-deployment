@@ -74,49 +74,104 @@ func main() {
 	realMain(clientset, namespace, name, timeout)
 }
 
-func deploymentProgress(clientset kubernetes.Interface, namespace string, name string) (int32, int32, error) {
+func deploymentProgress(clientset kubernetes.Interface, namespace string, name string) (int32, int32, bool, error) {
 	deployments, err := clientset.AppsV1().Deployments(namespace).List(metav1.ListOptions{})
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, false, err
 	} else if len(deployments.Items) == 0 {
-		return 0, 0, fmt.Errorf("no deployments in namespace %s", namespace)
+		return 0, 0, false, fmt.Errorf("no deployments in namespace %s", namespace)
 	}
 	for _, deployment := range deployments.Items {
 		if deployment.ObjectMeta.Name == name {
 			return deploymentObjectProgress(clientset, deployment, namespace)
 		}
 	}
-	return 0, 0, fmt.Errorf("no deployment %s in namespace %s", name, namespace)
+	return 0, 0, false, fmt.Errorf("no deployment %s in namespace %s", name, namespace)
 }
 
-func deploymentObjectProgress(clientset kubernetes.Interface, deployment appsv1.Deployment, namespace string) (int32, int32, error) {
+// deploymentObjectProgress returns:
+// ready replicas (int32)
+// desired replicas (int32)
+// whether the images have been verified (bool)
+// an optional error parameter
+func deploymentObjectProgress(clientset kubernetes.Interface, deployment appsv1.Deployment, namespace string) (int32, int32, bool, error) {
 	var desired int32
 	var ready int32
 
+	// fetch images
+	containers := deployment.Spec.Template.Spec.Containers
+	imageMap := make(map[string]int)
+	for _, container := range containers {
+		imageMap[container.Image] = 1
+	}
+
+	// fetch desired replica count
 	desired = *deployment.Spec.Replicas
+
+	// fetch selector
 	set := labels.Set(deployment.Spec.Selector.MatchLabels)
 	listOptions := metav1.ListOptions{LabelSelector: set.AsSelector().String()}
 
 	pods, err := clientset.CoreV1().Pods(namespace).List(listOptions)
 	if err != nil {
-		return 0, 0, fmt.Errorf("can't fetch pods matching selector %v", deployment.Spec.Selector.MatchLabels)
+		return ready, desired, false, fmt.Errorf("can't fetch pods matching selector %v", deployment.Spec.Selector.MatchLabels)
 	}
 
+	// reset ready count
+	ready = 0
 	for _, pod := range pods.Items {
 		var containerReady int
-		var containerNonReady int
+		var containerNotReady int
+
+		name := pod.ObjectMeta.Name
+
+		// process container image info
+		podContainers := pod.Spec.Containers
+		for _, podContainer := range podContainers {
+			_, ok := imageMap[podContainer.Image]
+			if !ok {
+				// skip pod but don't throw error
+				log.Println(fmt.Sprintf("%s: skipping pod with image %s", au.Bold(au.Cyan("INFO")), podContainer.Image))
+				return ready, desired, false, nil
+			}
+		}
+
+		// process status
 		for _, containerStatus := range pod.Status.ContainerStatuses {
 			if containerStatus.Ready == true {
 				containerReady++
 			} else {
-				containerNonReady++
+				containerNotReady++
+			}
+
+			// fail immediately in case of pod restarts
+			restartCount := containerStatus.RestartCount
+			if restartCount > 0 {
+				plural := "s"
+				if restartCount == 1 {
+					plural = ""
+				}
+				return ready, desired, true, fmt.Errorf("pod %s has restarted %d time%s", name, restartCount, plural)
+			}
+
+			// also fail when deployment is in waiting state (e.g. ImagePullBackOff)
+			if containerStatus.State.Waiting != nil {
+				reason := containerStatus.State.Waiting.Reason
+				switch reason {
+					case "ErrImagePull":
+						fallthrough
+					case "ImagePullBackOff":
+						return ready, desired, true, fmt.Errorf("pod %s in waiting state (%s)", name, reason)
+					default:
+						log.Println(fmt.Sprintf("%s: pod %s in waiting state (%s)", au.Bold(au.Cyan("INFO")), name, reason))
+				}
 			}
 		}
-		if containerNonReady == 0 && containerReady > 0 {
+		if containerNotReady == 0 && containerReady > 0 {
 			ready++
 		}
 	}
-	return ready, desired, nil
+	return ready, desired, true, nil
 }
 
 func realMain(clientset kubernetes.Interface, namespace string, name string, timeout int) {
@@ -137,7 +192,7 @@ func realMain(clientset kubernetes.Interface, namespace string, name string, tim
 	ticker := time.NewTicker(time.Millisecond * time.Duration(1000) * time.Duration(probeIntervalSeconds))
 	go func() {
 		for range ticker.C {
-			ready, desired, err := deploymentProgress(clientset, namespace, name)
+			ready, desired, imagesVerified, err := deploymentProgress(clientset, namespace, name)
 			if err != nil {
 				log.Println(fmt.Sprintf("%s: %v", au.Bold(au.Red("ERROR")), err))
 				os.Exit(1)
@@ -145,7 +200,7 @@ func realMain(clientset kubernetes.Interface, namespace string, name string, tim
 
 			log.Println(fmt.Sprintf("%s: %d/%d", au.Bold(au.Cyan("INFO")), au.Bold(ready), au.Bold(desired)))
 
-			if ready == desired {
+			if ready == desired && imagesVerified {
 				log.Println(fmt.Sprintf("%s: deployment %s in namespace %s verified", au.Bold(au.Cyan("INFO")), name, namespace))
 				os.Exit(0)
 			}
