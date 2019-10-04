@@ -22,6 +22,16 @@ Usage: verify-deployment <DEPLOYMENT>
     	timeout (s) (default 300)
 ```
 
+## Scaling up a working deployment
+```
+$ kubectl scale deployment analysis --replicas=1 && ./verify-deployment analysis
+deployment.extensions/analysis scaled
+2019/10/04 08:19:33 INFO: verifying deployment analysis in namespace default
+2019/10/04 08:21:28 INFO: 0/1
+2019/10/04 08:21:33 INFO: 1/1
+2019/10/04 08:21:33 INFO: deployment analysis in namespace default verified
+```
+
 ## Scaling up a broken deployment
 ```
 $ kubectl scale deployment analysis --replicas=3 && ./verify-deployment analysis
